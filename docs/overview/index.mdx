@@ -1,4 +1,342 @@
----
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Form
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+import os, uuid, subprocess, json, io, hashlib, random
+from typing import List
+from PIL import Image
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+
+SECRET_KEY = os.environ.get("SECRET_KEY", "change_this_secret_key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, "app_full.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+YTDLP_BIN = os.environ.get("YTDLP_BIN", "yt-dlp")
+
+# -----------------------------
+# DATABASE (SQLAlchemy)
+# -----------------------------
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+
+class Subscription(Base):
+    __tablename__ = 'subscriptions'
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    plan = Column(String)
+    status = Column(String, default='inactive')
+    started_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    txn_id = Column(String, nullable=True)
+    user = relationship('User')
+
+class Task(Base):
+    __tablename__ = 'tasks'
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    source_url = Column(Text)
+    status = Column(String, default='queued')
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    user = relationship('User')
+
+class Report(Base):
+    __tablename__ = 'reports'
+    id = Column(String, primary_key=True, index=True)
+    task_id = Column(String, ForeignKey('tasks.id'))
+    user_id = Column(Integer, ForeignKey('users.id'))
+    summary = Column(Text)  # JSON string
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship('User')
+
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------
+# AUTH HELPERS
+# -----------------------------
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+app = FastAPI(title="Deepfake Detection SaaS - Full Prototype")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded
+
+def decode_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+def get_current_user(token: str = Depends(oauth2_scheme), db=Depends(get_db)):
+    payload = decode_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    email = payload.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+# -----------------------------
+# AUTH ROUTES
+# -----------------------------
+
+@app.post('/api/auth/register')
+def register(email: str = Form(...), password: str = Form(...), db=Depends(get_db)):
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail='Email already registered')
+    u = User(email=email, password_hash=hash_password(password))
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return {"msg": "registered"}
+
+@app.post('/token')
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail='Incorrect username or password')
+    token = create_access_token({"sub": user.email})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.get('/api/user/me')
+def me(user=Depends(get_current_user)):
+    return {"email": user.email, "id": user.id}
+
+# -----------------------------
+# SUBSCRIPTION & bKash MOCK
+# -----------------------------
+
+@app.post('/api/subscription/create')
+def create_subscription(plan: str = Form(...), db=Depends(get_db), user=Depends(get_current_user)):
+    sub = Subscription(user_id=user.id, plan=plan, status='pending')
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    payment_id = str(uuid.uuid4())  # In real integration: call bKash API here and get payment url
+    return {"payment_url": f"/pay/simulate/{payment_id}", "payment_id": payment_id, "sub_id": sub.id}
+
+@app.get('/pay/simulate/{pid}', response_class=HTMLResponse)
+def pay_simulate(pid: str):
+    bkash_number = "০১৯৭৩৯৯৫১৬৭"
+    html = f"""
+    <html><body>
+    <h3>bKash Mock Payment</h3>
+    <p>পেমেন্ট আইডি: <strong>{pid}</strong></p>
+    <p>পেমেন্ট করার জন্য নিচের বিকাশ নম্বরে টাকা পাঠান:</p>
+    <p><strong>বিকাশ নাম্বার: {bkash_number}</strong></p>
+    <form action='/pay/simulate/{pid}/confirm' method='post'>
+        <button type='submit'>Confirm Payment</button>
+    </form>
+    </body></html>
+    """
+    return HTMLResponse(content=html)
+
+@app.post('/pay/simulate/{pid}/confirm')
+def pay_confirm(pid: str, db=Depends(get_db)):
+    sub = db.query(Subscription).filter(Subscription.status == 'pending').order_by(Subscription.id.desc()).first()
+    if not sub:
+        return HTMLResponse(content='No pending subscription found')
+    sub.status = 'active'
+    sub.started_at = datetime.utcnow()
+    sub.expires_at = datetime.utcnow() + timedelta(days=30)
+    sub.txn_id = pid
+    db.commit()
+    return HTMLResponse(content=f'Subscription {sub.id} activated (mock)')
+
+@app.post('/api/subscription/webhook')
+def subscription_webhook(payload: dict = None, db=Depends(get_db)):
+    # Example payload handling (bKash would POST transaction info here)
+    # Payload should contain: user identifier or order id, transaction id, status
+    return {"msg": "webhook received (demo)"}
+
+# -----------------------------
+# UTILITY: STREAM FRAMES (ffmpeg) WITHOUT SAVING
+# -----------------------------
+
+def extract_frames_from_stream(source_url: str, max_frames: int = 8, fps: int = 1):
+    frames = []
+    cmd = [FFMPEG_BIN, '-i', source_url, '-vf', f'fps={fps}', '-vframes', str(max_frames), '-f', 'image2pipe', '-vcodec', 'png', '-']
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = proc.stdout
+        while len(frames) < max_frames:
+            data = b''
+            while True:
+                chunk = out.read(1024)
+                if not chunk:
+                    break
+                data += chunk
+                try:
+                    img = Image.open(io.BytesIO(data))
+                    img.load()
+                    frames.append(img.convert('RGB'))
+                    break
+                except Exception:
+                    if len(data) > 5 * 1024 * 1024:
+                        break
+                    continue
+            if not chunk:
+                break
+        proc.kill()
+    except Exception as e:
+        print('ffmpeg streaming error:', e)
+    return frames
+
+# -----------------------------
+# DEEPFAKE DETECTION (PLACEHOLDER)
+# -----------------------------
+
+def detect_deepfake_on_frames(frames: List[Image.Image]):
+    if not frames:
+        return {"is_fake": False, "probable_tool": None, "confidence": 0.0}
+    try:
+        m = hashlib.sha256()
+        for i, f in enumerate(frames[:4]):
+            b = f.tobytes()
+            m.update(hashlib.sha256(b[:10000]).digest())
+        digest = m.hexdigest()
+        score = (int(digest[:8], 16) % 1000) / 10.0  # 0.0 - 100.0
+        is_fake = score > 60.0
+        probable_tool = random.choice([None, 'DeepFaceLab', 'FaceSwap', 'Synthesia']) if is_fake else None
+        confidence = round(score, 2)
+    except Exception:
+        score = random.uniform(40, 95)
+        is_fake = score > 70
+        probable_tool = random.choice([None, 'DeepFaceLab', 'FaceSwap']) if is_fake else None
+        confidence = round(score, 2)
+    return {"is_fake": bool(is_fake), "probable_tool": probable_tool, "confidence": float(confidence)}
+
+# -----------------------------
+# PROCESS TASK (background)
+# -----------------------------
+
+def process_task(task_id: str):
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return
+        task.status = 'processing'
+        db.commit()
+
+        stream_url = task.source_url
+        try:
+            ytdlp_cmd = [YTDLP_BIN, '-g', task.source_url]
+            p = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = p.communicate(timeout=10)
+            if out:
+                stream_url = out.decode().splitlines()[0]
+        except Exception as e:
+            print('yt-dlp resolve failed:', e)
+            stream_url = task.source_url
+
+        frames = extract_frames_from_stream(stream_url, max_frames=6, fps=1)
+        result = detect_deepfake_on_frames(frames)
+
+        report = Report(id=str(uuid.uuid4()), task_id=task.id, user_id=task.user_id,
+                        summary=json.dumps({
+                            'source_url': task.source_url,
+                            'checked_at': datetime.utcnow().isoformat(),
+                            'result': result
+                        }))
+        task.status = 'done'
+        task.completed_at = datetime.utcnow()
+        db.add(report)
+        db.commit()
+    except Exception as e:
+        print('process_task error:', e)
+        try:
+            task.status = 'failed'
+            db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+# -----------------------------
+# TASK SUBMIT ENDPOINT
+# -----------------------------
+
+@app.post('/api/tasks/submit')
+def submit_task(source_url: str = Form(...), background_tasks: BackgroundTasks = None,
+                db=Depends(get_db), user=Depends(get_current_user)):
+    sub = db.query(Subscription).filter(Subscription.user_id == user.id, Subscription.status == 'active').first()
+    if not sub:
+        raise HTTPException(status_code=402, detail='No active subscription')
+    task_id = str(uuid.uuid4())
+    t = Task(id=task_id, user_id=user.id, source_url=source_url, status='queued')
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    if background_tasks is not None:
+        background_tasks.add_task(process_task, task_id)
+    else:
+        process_task(task_id)
+    return {"task_id": task_id, "status": "queued"}
+
+@app.get('/api/tasks/{task_id}/status')
+def task_status(task_id: str, db=Depends(get_db), user=Depends(get_current_user)):
+    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user.id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail='Task not found')
+    report = db.query(Report).filter(Report.task_id == task.id).first()
+    resp = {"task_id": task.id, "status": task.status}
+    if report:
+        resp['report_id'] = report.id
+    return resp
+
+@app.get('/api/reports/{report_id}')
+def get_report(report_id: str, db=Depends(get_db), user=Depends(get_current_user)):
+    rep = db.query(Report).filter(Report.id == report_id, Report.user_id == user.id).first()
+    if not rep:
+        raise HTTPException(status_code=404, detail='Report not found')---
 sidebar_position: 1
 slug: /
 title: Overview
